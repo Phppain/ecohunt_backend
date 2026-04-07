@@ -187,9 +187,9 @@ def clean_report(
     return report
 
 @app.get("/reports", response_model=List[ReportOut])
-def get_reports():
-    # пример, возвращаем пустой массив
-    return []
+def get_reports(db: Session = Depends(get_db)):
+    return db.query(Report).all()
+
 
 # ---------------- LEADERBOARD ----------------
 @app.get("/leaderboard/global", response_model=List[LeaderboardEntry])
