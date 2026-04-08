@@ -107,7 +107,7 @@ def register(user: UserCreate, db: Session = Depends(get_db)):
     return db_user
 
 @app.post("/auth/login", response_model=Token)
-def login(user: UserLogin, db: Session = Depends(get_db)):
+def login(user: UserOut, db: Session = Depends(get_db)):
     db_user = db.query(User).filter(User.email == user.email).first()
     
     if not db_user or not pwd_context.verify(user.password, db_user.hashed_password):
