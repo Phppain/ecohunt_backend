@@ -10,6 +10,17 @@ import uuid
 import cv2
 from skimage.metrics import structural_similarity as ssim
 
+from passlib.context import CryptContext
+from fastapi.security import OAuth2PasswordBearer
+from jose import jwt
+from datetime import datetime, timedelta
+
+SECRET_KEY = "supersecretkey"
+ALGORITHM = "HS256"
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
+
 app = FastAPI()
 
 app.add_middleware(
@@ -76,23 +87,42 @@ def analyze_cleanup(before_path: str, after_path: str):
     ai_score = max(0.0, min(1.0, (before_density - after_density) * 8))
     return ai_score, cleaned, points
 
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id = payload.get("user_id")
+    except:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    user = db.query(User).filter(User.id == user_id).first()
+    return user
+
 # ---------------- AUTH ----------------
 @app.post("/auth/register", response_model=UserOut)
 def register(user: UserCreate, db: Session = Depends(get_db)):
-    db_user = User(nickname=user.nickname, email=user.email, hashed_password=user.password)
+    db_user = User(nickname=user.nickname, email=user.email, hashed_password=pwd_context.hash(user.password))
     db.add(db_user)
     db.commit()
     db.refresh(db_user)
     return db_user
 
 @app.post("/auth/login", response_model=Token)
-def login():
-    return {"access_token": "fakejwt", "token_type": "bearer"}
+def login(user: UserLogin, db: Session = Depends(get_db)):
+    db_user = db.query(User).filter(User.email == user.email).first()
+    
+    if not db_user or not pwd_context.verify(user.password, db_user.hashed_password):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    token = jwt.encode(
+        {"user_id": db_user.id, "exp": datetime.utcnow() + timedelta(days=7)},
+        SECRET_KEY,
+        algorithm=ALGORITHM,
+    )
+
+    return {"access_token": token, "token_type": "bearer"}
 
 @app.get("/auth/me", response_model=UserOut)
-def get_me(db: Session = Depends(get_db)):
-    # Возвращаем первого пользователя для примера
-    user = db.query(User).first()
+def get_me(user: User = Depends(get_current_user)):
     return user
 
 # ---------------- USERS ----------------
@@ -102,8 +132,7 @@ def get_user(user_id: int, db: Session = Depends(get_db)):
     return user
 
 @app.put("/users/me", response_model=UserOut)
-def update_profile(data: UserCreate, db: Session = Depends(get_db)):
-    user = db.query(User).first()
+def update_profile(data: UserCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     user.nickname = data.nickname
     user.email = data.email
     db.commit()
@@ -111,8 +140,12 @@ def update_profile(data: UserCreate, db: Session = Depends(get_db)):
     return user
 
 @app.patch("/users/me/permissions", response_model=UserOut)
-def update_permissions(camera: bool = False, geolocation: bool = False, db: Session = Depends(get_db)):
-    user = db.query(User).first()
+def update_permissions(
+    camera: bool = False,
+    geolocation: bool = False,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
     user.camera_permission = camera
     user.geo_permission = geolocation
     db.commit()
@@ -121,14 +154,25 @@ def update_permissions(camera: bool = False, geolocation: bool = False, db: Sess
 
 # ---------------- FRIENDS ----------------
 @app.post("/friends/add", response_model=FriendOut)
-def add_friend(friend: FriendCreate, db: Session = Depends(get_db)):
+def add_friend(friend: FriendCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     friend_user = db.query(User).filter(User.nickname == friend.nickname).first()
+
     if not friend_user:
         raise HTTPException(status_code=404, detail="User not found")
-    db_friend = Friend(user_id=1, friend_id=friend_user.id)
+
+    exists = db.query(Friend).filter(
+        Friend.user_id == user.id,
+        Friend.friend_id == friend_user.id
+    ).first()
+
+    if exists:
+        raise HTTPException(status_code=400, detail="Already friends")
+
+    db_friend = Friend(user_id=user.id, friend_id=friend_user.id)
     db.add(db_friend)
     db.commit()
     db.refresh(db_friend)
+
     return friend_user
 
 @app.get("/friends", response_model=List[FriendOut])
@@ -136,24 +180,43 @@ def get_friends(db: Session = Depends(get_db)):
     friends = db.query(User).all()
     return friends
 
+import random
+
 @app.get("/friends/locations")
 def friends_locations(db: Session = Depends(get_db)):
     friends = db.query(User).all()
-    return [{"id": f.id, "nickname": f.nickname, "lat": 43.23, "lng": 76.92} for f in friends]
 
+    return [
+        {
+            "id": f.id,
+            "nickname": f.nickname,
+            "lat": 43.2 + random.uniform(-0.05, 0.05),
+            "lng": 76.9 + random.uniform(-0.05, 0.05)
+        }
+        for f in friends
+    ]
 # ---------------- REPORTS ----------------
 @app.post("/reports", response_model=ReportOut)
 def create_report(
     lat: float = Form(...),
     lng: float = Form(...),
     image_before: UploadFile = File(...),
+    user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     before_path = _save_upload(image_before, "before")
-    db_report = Report(lat=lat, lng=lng, image_before=before_path, user_id=1)
+
+    db_report = Report(
+        lat=lat,
+        lng=lng,
+        image_before=before_path,
+        user_id=user.id
+    )
+
     db.add(db_report)
     db.commit()
     db.refresh(db_report)
+
     return db_report
 
 @app.post("/reports/{report_id}/clean", response_model=ReportOut)
@@ -161,6 +224,7 @@ def clean_report(
     report_id: int,
     image_after: UploadFile = File(...),
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     report = db.query(Report).filter(Report.id == report_id).first()
     if not report:
@@ -176,7 +240,7 @@ def clean_report(
     report.ai_points_awarded = points_awarded
 
     # Apply points to user (simple demo: first user)
-    user = db.query(User).first()
+    user = user
     if user and points_awarded:
         user.points = (user.points or 0) + points_awarded
 
