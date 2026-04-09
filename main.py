@@ -100,7 +100,7 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
 # ---------------- AUTH ----------------
 @app.post("/auth/register", response_model=UserOut)
 def register(user: UserCreate, db: Session = Depends(get_db)):
-    db_user = User(nickname=user.nickname, email=user.email, hashed_password=pwd_context.hash(user.password))
+    db_user = User(nickname=user.nickname, email=user.email, hashed_password=pwd_context.hash(user.password[:72]))
     db.add(db_user)
     db.commit()
     db.refresh(db_user)
