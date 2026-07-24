@@ -6,9 +6,11 @@ from typing import List
 from fastapi.middleware.cors import CORSMiddleware
 import os
 import uuid
+import numpy as np
+import gc
+from ultralytics import YOLO
 
 import cv2
-from skimage.metrics import structural_similarity as ssim
 
 from passlib.context import CryptContext
 from fastapi.security import OAuth2PasswordBearer
@@ -17,6 +19,8 @@ from datetime import datetime, timedelta
 
 SECRET_KEY = "supersecretkey"
 ALGORITHM = "HS256"
+
+model = YOLO("yolov8n.pt")
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
@@ -42,50 +46,92 @@ def get_db():
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "./uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
+MAX_SIZE = 800
+
+def load_image(path: str):
+    img = cv2.imread(path)
+
+    if img is None:
+        return None
+
+    return img
+
+def detect_trash(image_path):
+
+    results = model.predict(
+        image_path,
+        imgsz=640,
+        conf=0.35,
+        verbose=False
+    )
+
+    count = 0
+
+    for result in results:
+        count += len(result.boxes)
+
+    return count
+
 def _save_upload(file: UploadFile, prefix: str) -> str:
-    ext = os.path.splitext(file.filename or "")[1].lower()
-    if ext not in [".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"]:
-        # keep it simple; clients can still upload jpg/png
-        ext = ".jpg"
-    name = f"{prefix}_{uuid.uuid4().hex}{ext}"
+    name = f"{prefix}_{uuid.uuid4().hex}.jpg"
     path = os.path.join(UPLOAD_DIR, name)
-    with open(path, "wb") as f:
-        f.write(file.file.read())
+
+    data = file.file.read()
+
+    img = cv2.imdecode(
+        np.frombuffer(data, np.uint8),
+        cv2.IMREAD_COLOR
+    )
+
+    if img is None:
+        raise HTTPException(400, "Invalid image")
+
+    h, w = img.shape[:2]
+
+    if max(h, w) > MAX_SIZE:
+        scale = MAX_SIZE / max(h, w)
+
+        img = cv2.resize(
+            img,
+            (int(w * scale), int(h * scale)),
+            interpolation=cv2.INTER_AREA
+        )
+
+    cv2.imwrite(
+        path,
+        img,
+        [cv2.IMWRITE_JPEG_QUALITY, 85]
+    )
+
+    del img
+    gc.collect()
+
     return path
 
-def analyze_cleanup(before_path: str, after_path: str):
-    """
-    Free local "AI" (no paid APIs): compares before/after using SSIM + edge density.
-    Returns (ai_score 0..1, cleaned bool, points_awarded int).
-    """
-    before = cv2.imread(before_path)
-    after = cv2.imread(after_path)
-    if before is None or after is None:
-        return None, None, 0
+def analyze_cleanup(before_path, after_path):
 
-    before_g = cv2.cvtColor(before, cv2.COLOR_BGR2GRAY)
-    after_g = cv2.cvtColor(after, cv2.COLOR_BGR2GRAY)
-    after_g = cv2.resize(after_g, (before_g.shape[1], before_g.shape[0]))
+    before_count = detect_trash(before_path)
+    after_count = detect_trash(after_path)
 
-    score = float(ssim(before_g, after_g))
+    removed = max(
+        0,
+        before_count - after_count
+    )
 
-    # Simple "cleanup" signal: fewer edges after cleaning.
-    before_edges = cv2.Canny(before_g, 80, 160)
-    after_edges = cv2.Canny(after_g, 80, 160)
-    before_density = float(before_edges.mean())
-    after_density = float(after_edges.mean())
+    cleaned = removed > 0
 
-    cleaned = (score < 0.92) and (after_density < before_density * 0.95)
+    if before_count == 0:
+        ai_score = 1.0
+    else:
+        ai_score = removed / before_count
 
-    # Points: reward meaningful change + cleaner edge density.
-    delta = max(0.0, (before_density - after_density))
-    points = int(min(50, max(5, delta * 300)))
-    if not cleaned:
-        points = int(max(0, points // 4))
+    points = removed * 10
 
-    # Normalize an "AI score" where higher means "better cleaned"
-    ai_score = max(0.0, min(1.0, (before_density - after_density) * 8))
-    return ai_score, cleaned, points
+    return (
+        ai_score,
+        cleaned,
+        points
+    )
 
 def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
     try:
