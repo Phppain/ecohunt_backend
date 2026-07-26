@@ -146,6 +146,7 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
 # ---------------- AUTH ----------------
 @app.post("/auth/register", response_model=UserOut)
 def register(user: UserCreate, db: Session = Depends(get_db)):
+        
     db_user = User(nickname=user.nickname, email=user.email, hashed_password=pwd_context.hash(user.password[:72]))
     db.add(db_user)
     db.commit()
@@ -200,11 +201,20 @@ def update_permissions(
 
 # ---------------- FRIENDS ----------------
 @app.post("/friends/add", response_model=FriendOut)
-def add_friend(friend: FriendCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    friend_user = db.query(User).filter(User.nickname == friend.nickname).first()
+def add_friend(
+    friend: FriendCreate,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    friend_user = db.query(User).filter(
+        User.nickname == friend.nickname
+    ).first()
 
     if not friend_user:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(404, "User not found")
+
+    if friend_user.id == user.id:
+        raise HTTPException(400, "You can't add yourself")
 
     exists = db.query(Friend).filter(
         Friend.user_id == user.id,
@@ -212,35 +222,88 @@ def add_friend(friend: FriendCreate, user: User = Depends(get_current_user), db:
     ).first()
 
     if exists:
-        raise HTTPException(status_code=400, detail="Already friends")
+        raise HTTPException(400, "Already friends")
 
-    db_friend = Friend(user_id=user.id, friend_id=friend_user.id)
-    db.add(db_friend)
+    db.add(Friend(
+        user_id=user.id,
+        friend_id=friend_user.id
+    ))
+
+    db.add(Friend(
+        user_id=friend_user.id,
+        friend_id=user.id
+    ))
+
     db.commit()
-    db.refresh(db_friend)
 
     return friend_user
 
 @app.get("/friends", response_model=List[FriendOut])
-def get_friends(db: Session = Depends(get_db)):
-    friends = db.query(User).all()
+def get_friends(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    relations = db.query(Friend).filter(
+        Friend.user_id == user.id
+    ).all()
+
+    ids = [f.friend_id for f in relations]
+
+    if not ids:
+        return []
+
+    friends = db.query(User).filter(
+        User.id.in_(ids)
+    ).all()
+
     return friends
 
 import random
 
 @app.get("/friends/locations")
-def friends_locations(db: Session = Depends(get_db)):
-    friends = db.query(User).all()
+def friends_locations(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    relations = db.query(Friend).filter(
+        Friend.user_id == user.id
+    ).all()
+
+    ids = [f.friend_id for f in relations]
+
+    friends = db.query(User).filter(
+        User.id.in_(ids)
+    ).all()
 
     return [
         {
             "id": f.id,
             "nickname": f.nickname,
             "lat": 43.2 + random.uniform(-0.05, 0.05),
-            "lng": 76.9 + random.uniform(-0.05, 0.05)
+            "lng": 76.9 + random.uniform(-0.05, 0.05),
         }
         for f in friends
     ]
+
+@app.delete("/friends/{friend_id}")
+def remove_friend(
+    friend_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    db.query(Friend).filter(
+        Friend.user_id == user.id,
+        Friend.friend_id == friend_id
+    ).delete()
+
+    db.query(Friend).filter(
+        Friend.user_id == friend_id,
+        Friend.friend_id == user.id
+    ).delete()
+
+    db.commit()
+
+    return {"message": "Friend removed"}
 # ---------------- REPORTS ----------------
 @app.post("/reports", response_model=ReportOut)
 def create_report(
@@ -304,11 +367,45 @@ def get_reports(db: Session = Depends(get_db)):
 # ---------------- LEADERBOARD ----------------
 @app.get("/leaderboard/global", response_model=List[LeaderboardEntry])
 def global_leaderboard(db: Session = Depends(get_db)):
-    users = db.query(User).order_by(User.points.desc()).all()
-    return [{"nickname": u.nickname, "points": u.points} for u in users]
+    users = (
+        db.query(User)
+        .order_by(User.points.desc())
+        .all()
+    )
+
+    return [
+    {
+        "rank": i + 1,
+        "nickname": u.nickname,
+        "points": u.points
+    }
+    for i, u in enumerate(users)
+]
 
 @app.get("/leaderboard/friends", response_model=List[LeaderboardEntry])
-def friends_leaderboard(db: Session = Depends(get_db)):
-    # простой пример, все пользователи
-    users = db.query(User).all()
-    return [{"nickname": u.nickname, "points": u.points} for u in users]
+def friends_leaderboard(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+
+    relations = db.query(Friend).filter(
+        Friend.user_id == user.id
+    ).all()
+
+    ids = [f.friend_id for f in relations]
+    ids.append(user.id)
+
+    users = (
+        db.query(User)
+        .filter(User.id.in_(ids))
+        .order_by(User.points.desc())
+        .all()
+    )
+
+    return [
+        {
+            "nickname": u.nickname,
+            "points": u.points
+        }
+        for u in users
+    ]
