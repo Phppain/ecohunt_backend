@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
 from sqlalchemy.orm import Session
-from db import SessionLocal, User, Friend, Report
+from db import SessionLocal, User, Friend, Report, FriendRequest
 from schemas import *
 from typing import List
 from fastapi.middleware.cors import CORSMiddleware
@@ -144,14 +144,36 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     return user
 
 # ---------------- AUTH ----------------
-@app.post("/auth/register", response_model=UserOut)
+@app.post("/auth/register", response_model=Token)
 def register(user: UserCreate, db: Session = Depends(get_db)):
-        
-    db_user = User(nickname=user.nickname, email=user.email, hashed_password=pwd_context.hash(user.password[:72]))
+    exists = db.query(User).filter(User.email == user.email).first()
+
+    if exists:
+        raise HTTPException(status_code=400, detail="Email already exists")
+
+    db_user = User(
+        nickname=user.nickname,
+        email=user.email,
+        hashed_password=pwd_context.hash(user.password[:72]),
+    )
+
     db.add(db_user)
     db.commit()
     db.refresh(db_user)
-    return db_user
+
+    token = jwt.encode(
+        {
+            "user_id": db_user.id,
+            "exp": datetime.utcnow() + timedelta(days=7),
+        },
+        SECRET_KEY,
+        algorithm=ALGORITHM,
+    )
+
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+    }
 
 @app.post("/auth/login", response_model=Token)
 def login(user: UserLogin, db: Session = Depends(get_db)):
@@ -170,6 +192,7 @@ def login(user: UserLogin, db: Session = Depends(get_db)):
 
 @app.get("/auth/me", response_model=UserOut)
 def get_me(user: User = Depends(get_current_user)):
+    print(user)
     return user
 
 # ---------------- USERS ----------------
@@ -199,44 +222,183 @@ def update_permissions(
     db.refresh(user)
     return user
 
+@app.patch("/users/location")
+def update_location(
+    data: UpdateLocation,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    user.latitude = data.lat
+    user.longitude = data.lng
+
+    db.commit()
+    db.refresh(user)
+
+    return {
+        "lat": user.latitude,
+        "lng": user.longitude
+    }
+
 # ---------------- FRIENDS ----------------
-@app.post("/friends/add", response_model=FriendOut)
-def add_friend(
+@app.post("/friends/request")
+def send_friend_request(
     friend: FriendCreate,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+
     friend_user = db.query(User).filter(
         User.nickname == friend.nickname
     ).first()
 
+
     if not friend_user:
-        raise HTTPException(404, "User not found")
+        raise HTTPException(
+            404,
+            "User not found"
+        )
+
 
     if friend_user.id == user.id:
-        raise HTTPException(400, "You can't add yourself")
+        raise HTTPException(
+            400,
+            "Can't add yourself"
+        )
 
-    exists = db.query(Friend).filter(
-        Friend.user_id == user.id,
-        Friend.friend_id == friend_user.id
+
+    exists = db.query(FriendRequest).filter(
+        FriendRequest.sender_id == user.id,
+        FriendRequest.receiver_id == friend_user.id,
+        FriendRequest.accepted == False
     ).first()
 
+
     if exists:
-        raise HTTPException(400, "Already friends")
+        raise HTTPException(
+            400,
+            "Request already exists"
+        )
 
-    db.add(Friend(
-        user_id=user.id,
-        friend_id=friend_user.id
-    ))
 
-    db.add(Friend(
-        user_id=friend_user.id,
-        friend_id=user.id
-    ))
+    request = FriendRequest(
+        sender_id=user.id,
+        receiver_id=friend_user.id
+    )
+
+
+    db.add(request)
+    db.commit()
+    db.refresh(request)
+
+
+    return {
+        "request_id": request.id
+    }
+
+@app.get("/friends/requests")
+def get_friend_requests(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+
+    requests = db.query(FriendRequest).filter(
+        FriendRequest.receiver_id == user.id,
+        FriendRequest.accepted == False
+    ).all()
+
+
+    result = []
+
+    for r in requests:
+
+        sender = db.query(User).filter(
+            User.id == r.sender_id
+        ).first()
+
+
+        result.append({
+            "request_id": r.id,
+            "id": sender.id,
+            "nickname": sender.nickname,
+            "email": sender.email,
+            "points": sender.points
+        })
+
+
+    return result
+
+@app.post("/friends/requests/{request_id}/accept")
+def accept_request(
+    request_id:int,
+    user:User = Depends(get_current_user),
+    db:Session = Depends(get_db)
+):
+
+    request = db.query(FriendRequest).filter(
+        FriendRequest.id == request_id,
+        FriendRequest.receiver_id == user.id
+    ).first()
+
+
+    if not request:
+        raise HTTPException(
+            404,
+            "Request not found"
+        )
+
+
+    db.add(
+        Friend(
+            user_id=request.sender_id,
+            friend_id=request.receiver_id
+        )
+    )
+
+
+    db.add(
+        Friend(
+            user_id=request.receiver_id,
+            friend_id=request.sender_id
+        )
+    )
+
+
+    request.accepted = True
 
     db.commit()
 
-    return friend_user
+
+    return {
+        "message":"Friend added"
+    }
+
+@app.delete("/friends/requests/{request_id}")
+def decline_request(
+    request_id:int,
+    user:User = Depends(get_current_user),
+    db:Session = Depends(get_db)
+):
+
+    request = db.query(FriendRequest).filter(
+        FriendRequest.id == request_id,
+        FriendRequest.receiver_id == user.id
+    ).first()
+
+
+    if not request:
+        raise HTTPException(
+            404,
+            "Request not found"
+        )
+
+
+    db.delete(request)
+    db.commit()
+
+
+    return {
+        "message":"Declined"
+    }
 
 @app.get("/friends", response_model=List[FriendOut])
 def get_friends(
@@ -276,14 +438,16 @@ def friends_locations(
     ).all()
 
     return [
-        {
-            "id": f.id,
-            "nickname": f.nickname,
-            "lat": 43.2 + random.uniform(-0.05, 0.05),
-            "lng": 76.9 + random.uniform(-0.05, 0.05),
-        }
-        for f in friends
-    ]
+    {
+        "id": f.id,
+        "nickname": f.nickname,
+        "lat": f.latitude,
+        "lng": f.longitude,
+        "points": f.points
+    }
+    for f in friends
+    if f.latitude is not None and f.longitude is not None
+]
 
 @app.delete("/friends/{friend_id}")
 def remove_friend(
@@ -350,8 +514,14 @@ def clean_report(
 
     # Apply points to user (simple demo: first user)
     user = user
+    print("Points awarded:", points_awarded)
+    print("User points before:", user.points)
+
+
     if user and points_awarded:
         user.points = (user.points or 0) + points_awarded
+
+    print("User points after:", user.points)
 
     report.reports_count += 1
     report.severity = "red" if report.reports_count >= 8 else "yellow"
